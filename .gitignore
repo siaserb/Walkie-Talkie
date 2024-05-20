@@ -1,0 +1,6 @@
+/Client/.devcontainer/
+/Client/.vscode/
+/Client/build/
+/Server/.devcontainer/
+/Server/.vscode/
+/Server/build/
