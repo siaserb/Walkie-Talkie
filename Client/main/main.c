@@ -6,24 +6,23 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include <string.h>
+#include "driver/gpio.h"
 
 #define EXAMPLE_ESP_WIFI_SSID "esp32_ap"
 #define EXAMPLE_ESP_WIFI_PASS "password"
 #define HOST_IP_ADDR "192.168.4.1"
 #define PORT 1234
 
+#define BUTTON_GPIO GPIO_NUM_35
+
+uint8_t buttonState = 2;
+
 static const char *TAG = "UDP_CLIENT";
 static bool got_ip = false;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
-{
-    if (event_id == IP_EVENT_STA_GOT_IP || event_base == IP_EVENT)
-    {
-                       ESP_LOGE(TAG, "IP OK");
-               got_ip = true; // Set IP flag when IP is obtained
-    }
-    
+{   
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
          //got_ip = true;
@@ -117,7 +116,18 @@ static void udp_client_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
-        strcpy(payload, "Hello from ESP32 client!");
+        //strcpy(payload, "Hello from ESP32 client!");
+        if (buttonState == 1)
+        {
+            strcpy(payload, "Button pressed!");
+            buttonState = 2;
+        }
+        else if (buttonState == 0)
+        {
+            strcpy(payload, "Button released!");
+            buttonState = 2;
+        }
+        
         int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (err < 0) {
             ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
@@ -134,6 +144,33 @@ static void udp_client_task(void *pvParameters)
     }
 }
 
+
+
+void button_task(void* arg)
+{
+    esp_rom_gpio_pad_select_gpio(BUTTON_GPIO);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    int last_state = 0;
+    while(1) {
+        int state = gpio_get_level(BUTTON_GPIO);
+        if(state != last_state) {
+            last_state = state;
+            if(state == 0) {
+                ESP_LOGI(TAG, "Button Pressed");
+                // Відправте повідомлення, що кнопка натиснута
+                buttonState = 1;
+            } else {
+                ESP_LOGI(TAG, "Button Released");
+                // Відправте повідомлення, що кнопка відпущена
+                buttonState = 0;
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -145,6 +182,7 @@ void app_main(void)
     // Add a delay to ensure the client has enough time to connect to the AP
     vTaskDelay(10000 / portTICK_PERIOD_MS);
     xTaskCreate(udp_client_task, "udp_client", 4096, NULL, 5, NULL);
-    
-        ESP_LOGE(TAG, "Main OK");
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGE(TAG, "Main OK");
 }

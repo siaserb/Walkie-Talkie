@@ -5,13 +5,19 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
-#include "lwip/netif.h" // Include lwip netif header for esp_netif_get_ip_info
+#include "lwip/netif.h"
 #include <string.h>
+//#include "lvgl/lvgl.h"
+#include "driver/gpio.h"
 
 #define EXAMPLE_ESP_WIFI_SSID "esp32_ap"
 #define EXAMPLE_ESP_WIFI_PASS "password"
 #define EXAMPLE_MAX_STA_CONN 4
 #define PORT 1234
+
+#define BUTTON_GPIO GPIO_NUM_35
+
+uint8_t buttonState = 2;
 
 static const char *TAG = "UDP_SERVER";
 
@@ -160,6 +166,31 @@ static void udp_server_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+void button_task(void* arg)
+{
+    esp_rom_gpio_pad_select_gpio(BUTTON_GPIO);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    int last_state = 0;
+    while(1) {
+        int state = gpio_get_level(BUTTON_GPIO);
+        if(state != last_state) {
+            last_state = state;
+            if(state == 0) {
+                ESP_LOGI(TAG, "Button Pressed");
+                // Відправте повідомлення, що кнопка натиснута
+                buttonState = 1;
+            } else {
+                ESP_LOGI(TAG, "Button Released");
+                // Відправте повідомлення, що кнопка відпущена
+                buttonState = 0;
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -169,5 +200,6 @@ void app_main(void)
     wifi_init_softap();
     
     xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
     ESP_LOGE(TAG, "Main OK");
 }
