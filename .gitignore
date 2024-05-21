@@ -4,6 +4,7 @@
 /Server/.devcontainer/
 /Server/.vscode/
 /Server/build/
+/Server/components/
 /United/.devcontainer/
 /United/.vscode/
 /United/build/
