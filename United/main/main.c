@@ -11,6 +11,7 @@
 #include "math.h"
 #include "mbedtls/aes.h"
 
+// Визначаємо пристрій сервер чи клієнт
 //#define IS_SERVER
 #define IS_CLIENT
 
@@ -23,32 +24,38 @@
 #define I2S_WS_RX 25
 #define I2S_SCL_RX 26
 #define I2S_SD_RX 27
-#define BUTTON_GPIO GPIO_NUM_35
 
+#define BUTTON_GPIO GPIO_NUM_35
+#define ENCRYPTION_BUTTON_GPIO GPIO_NUM_0
+
+// Налаштування Wi-Fi
 #define EXAMPLE_ESP_WIFI_SSID "esp32_ap"
 #define EXAMPLE_ESP_WIFI_PASS "password"
 #define PORT 1234
 #define CLIENT_IP_ADDR "192.168.4.2"
 #define SERVER_IP_ADDR "192.168.4.1"
-#define EXAMPLE_BUFF_SIZE 1024
 
-#define SAMPLE_RATE 44100 // 44100 also ok
+#define UDP_BUFFER_SIZE 1024
+#define SAMPLE_RATE 44100 // Аудіо стандарт, частота дискретизації
+
+#define AES_KEY_SIZE 16
+
+uint8_t aes_key[AES_KEY_SIZE] = {
+    0x3d, 0xf2, 0x67, 0xf0, 0x34, 0xa9, 0xbc, 0x0b, 
+    0x8e, 0xac, 0xe5, 0x8f, 0x12, 0x3c, 0x56, 0x78
+};
 
 static i2s_chan_handle_t    rx_chan;
 static i2s_chan_handle_t    tx_chan;
 
-#define AES_KEY_SIZE 16
-
-static uint8_t aes_key[AES_KEY_SIZE] = {
-    0x3d, 0xf2, 0x67, 0xf0, 0x34, 0xa9, 0xbc, 0x0b, 
-    0x8e, 0xac, 0xe5, 0x8f, 0x12, 0x3c, 0x56, 0x78
-};
-#define AES_BLOCK_SIZE 16
-
-static const char *TAG = "UDP_UNITED";
+static const char *TAG = "Walkie_Talkie"; 
+#ifdef IS_CLIENT
 static bool got_ip = false;
+#endif
 volatile bool transmit_data = false;
+volatile bool encryption_enabled = true;
 
+// Обробник подій Wi-Fi
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {   
 #ifdef IS_SERVER
@@ -105,19 +112,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 
 void wifi_init(void)
 {
-    // Initialize the ESP32 WiFi stack
+    // Ініціалізація стеку WiFi
     ESP_ERROR_CHECK(esp_netif_init());
 
-    // Initialize the WiFi library with the default configuration
+    // Ініціалізація бібліотеки WiFi з налаштуваннями за замовчуванням
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    // Створення обробника подій WiFi
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
 #ifdef IS_SERVER
+    // Створення мережевого інтерфейсу для точки доступу (AP)
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
 
+    // Реєстрація обробника подій IP для AP
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = 
@@ -128,7 +138,7 @@ void wifi_init(void)
             .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
             .password = EXAMPLE_ESP_WIFI_PASS,
             .max_connection = 1,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK      // Режим автентифікації
         },
     };
     if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0) 
@@ -136,29 +146,36 @@ void wifi_init(void)
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    // Set the WiFi mode to AP
+    // Встановлення режиму WiFi як AP (точка доступу)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
-    // Set the WiFi configuration
+    // Встановлення конфігурації WiFi
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
 
-    // Start the WiFi interface
+    // Запуск інтерфейсу WiFi
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Configure the IP Address for the AP interface
+    // Налаштування IP-адреси для інтерфейсу AP
     esp_netif_ip_info_t ip_info;
     IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
     IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
     IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+
+    // Зупинка DHCP сервера для AP  
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+
+    // Встановлення IP-інформації для інтерфейсу AP
     ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+
+    // Запуск DHCP сервера для AP
     ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
 
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s", EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
 #else
-    // Create a new STA network interface instance
+    // Створення нового мережевого інтерфейсу STA (клієнт)
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
 
+    // Реєстрація обробника подій IP для STA
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = 
@@ -170,33 +187,64 @@ void wifi_init(void)
         },
     };
 
-    // Set the WiFi mode to STA
+    // Встановлення режиму WiFi як STA (клієнт)    
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    // Set the WiFi configuration
+    // Встановлення конфігурації WiFi
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
 
-    // Start the WiFi interface
+    // Запуск інтерфейсу WiFi
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Start the DHCP client
+    // Запуск DHCP клієнта
     ESP_ERROR_CHECK(esp_netif_dhcpc_start(sta_netif));
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 #endif
 }
 
+void encryption_button_task(void* arg)
+{
+    esp_rom_gpio_pad_select_gpio(ENCRYPTION_BUTTON_GPIO);
+
+    // Встановлення напрямку GPIO як вхід
+    gpio_set_direction(ENCRYPTION_BUTTON_GPIO, GPIO_MODE_INPUT);
+
+    // Встановлення режиму підтягування до живлення
+    gpio_set_pull_mode(ENCRYPTION_BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    int last_state = 1;
+    while(1) 
+    {
+        int state = gpio_get_level(ENCRYPTION_BUTTON_GPIO);
+        if(state != last_state)     // Перевірка на зміну стану кнопки
+        {
+            last_state = state;
+            if(state == 0) 
+            {
+                encryption_enabled = !encryption_enabled;
+                ESP_LOGI(TAG, "Encryption %s", encryption_enabled ? "enabled" : "disabled");
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);     // Затримка для запобігання багаторазового натискання кнопки
+    }
+}
+
 void button_task(void* arg)
 {
     esp_rom_gpio_pad_select_gpio(BUTTON_GPIO);
+
+    // Встановлення напрямку GPIO як вхід
     gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+
+    // Встановлення режиму підтягування до живлення
     gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
 
     int last_state = 1;
     while(1) 
     {
         int state = gpio_get_level(BUTTON_GPIO);
-        if(state != last_state) 
+        if(state != last_state)     // Перевірка на зміну стану кнопки
         {
             last_state = state;
             if(state == 0) 
@@ -210,7 +258,7 @@ void button_task(void* arg)
                transmit_data = false; 
             }
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(10 / portTICK_PERIOD_MS);    // Затримка для запобігання багаторазового натискання кнопки
     }
 }
 
@@ -221,7 +269,7 @@ void amplify_signal(int16_t *buffer, size_t length, float gain) {
     }
 }
 
-// Функція фільтрації сигналу (наприклад, простий високопропускний фільтр)
+// Функція фільтрації сигналу
 void high_pass_filter(int16_t *buffer, size_t length, float alpha) {
     int16_t prev = buffer[0];
     for (size_t i = 1; i < length; i++) {
@@ -231,6 +279,33 @@ void high_pass_filter(int16_t *buffer, size_t length, float alpha) {
     }
 }
 
+void my_aes_encrypt(uint8_t *input, uint8_t *output, size_t length, uint8_t *key) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+
+    // Шифрування даних блочним методом ECB
+    for (size_t i = 0; i < length; i += 16) {
+        mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input + i, output + i);
+    }
+
+    mbedtls_aes_free(&aes);
+}
+
+void my_aes_decrypt(uint8_t *input, uint8_t *output, size_t length, uint8_t *key) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, key, 128);
+
+    // Дешифрування даних блочним методом ECB
+    for (size_t i = 0; i < length; i += 16) {
+        mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, input + i, output + i);
+    }
+
+    mbedtls_aes_free(&aes);
+}
+
+
 void udp_send_task(void *pvParameters)
 {
     int addr_family = AF_INET;
@@ -239,9 +314,12 @@ void udp_send_task(void *pvParameters)
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(PORT);
 
-    uint8_t *r_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
-    assert(r_buf); // Check if r_buf allocation success
-    size_t r_bytes = 0;
+    // Виділення пам'яті для буфера даних та шифрованого буфера
+    uint8_t *read_buf = (uint8_t *)calloc(1, UDP_BUFFER_SIZE);
+    uint8_t *encrypted_buf = (uint8_t *)calloc(1, UDP_BUFFER_SIZE);
+    assert(read_buf); // Перевірка на успішне виділення пам'яті
+    assert(encrypted_buf);
+    size_t read_bytes = 0;
 
 #ifdef IS_SERVER
     dest_addr.sin_addr.s_addr = inet_addr(CLIENT_IP_ADDR);
@@ -251,15 +329,23 @@ void udp_send_task(void *pvParameters)
 
     while (1) {
         if (transmit_data) {
-            if (i2s_channel_read(rx_chan, r_buf, EXAMPLE_BUFF_SIZE, &r_bytes, 1000) == ESP_OK) {
+            if (i2s_channel_read(rx_chan, read_buf, UDP_BUFFER_SIZE, &read_bytes, 1000) == ESP_OK) {
                 // Підсилюємо сигнал
-                amplify_signal((int16_t *)r_buf, r_bytes / 2, 10.0f); // Підсилюємо в 10 разів
+                amplify_signal((int16_t *)read_buf, read_bytes / 2, 10.0f); // Підсилюємо в 10 разів
 
                 // Фільтруємо сигнал
-                //high_pass_filter((int16_t *)r_buf, r_bytes / 2, 0.9f);
+                //high_pass_filter((int16_t *)read_buf, read_bytes / 2, 0.9f);
 
+                // Шифрування даних, якщо увімкнено шифрування
+               if (encryption_enabled) {
+                    my_aes_encrypt(read_buf, encrypted_buf, read_bytes, aes_key);
+                } else {
+                    memcpy(encrypted_buf, read_buf, read_bytes);
+                }
+
+                // Відправка даних по UDP
                 int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-                int err = sendto(sock, r_buf, r_bytes, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+                int err = sendto(sock, encrypted_buf, read_bytes, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
                 if (err < 0) {
                     ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
                 }
@@ -269,70 +355,10 @@ void udp_send_task(void *pvParameters)
         vTaskDelay(10 / portTICK_PERIOD_MS);        // Для запобігання watch dog
     }
 
-
-    free(r_buf);
+    // Звільнення виділеної пам'яті
+    free(read_buf);
+    free(encrypted_buf);
 }
-
-// void udp_receive_task(void *pvParameters)
-// {
-//     int addr_family = AF_INET;
-//     int ip_protocol = IPPROTO_IP;
-//     struct sockaddr_in source_addr;
-//     source_addr.sin_family = AF_INET;
-//     source_addr.sin_port = htons(PORT);
-//     source_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-//     int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-//     bind(sock, (struct sockaddr *)&source_addr, sizeof(source_addr));
-
-//     uint8_t *w_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
-//     assert(w_buf); // Check if w_buf allocation success
-//     size_t w_bytes = 0;
-
-//     while (1) 
-//     {
-//                     ESP_LOGI(TAG, "Receiving");
-//         struct sockaddr_in dest_addr;
-//         socklen_t socklen = sizeof(dest_addr);
-//         int len = recvfrom(sock, w_buf, EXAMPLE_BUFF_SIZE, 0, (struct sockaddr *)&dest_addr, &socklen);
-
-//         if (len < 0)
-//         {
-//             ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
-//         }
-//         else
-//         {
-//             ESP_LOGI(TAG, "Check silence");
-//             // Check if the buffer is silent
-//             bool is_silent = true;
-//             for (int i = 0; i < len; i++)
-//             {
-//                 if (w_buf[i] != 0)
-//                 {
-//                     is_silent = false;
-//                     break;
-//                 }
-//             }
-
-//             if (is_silent)
-//             {
-//                 memset(w_buf, 0, EXAMPLE_BUFF_SIZE);
-//                 if (i2s_channel_write(tx_chan, w_buf, len, &w_bytes, 1000) == ESP_OK)
-//                 {
-//                     ESP_LOGE(TAG, "i2s buffer cleared");
-//                 }
-//             }
-//             else
-//             {
-//                 if (i2s_channel_write(tx_chan, w_buf, len, &w_bytes, 1000) != ESP_OK)
-//                 {
-//                     ESP_LOGE(TAG, "i2s write failed");
-//                 }
-//             }
-//         }
-//     }
-//     free(w_buf);
-// }
 
 void udp_receive_task(void *pvParameters)
 {
@@ -343,19 +369,24 @@ void udp_receive_task(void *pvParameters)
     source_addr.sin_port = htons(PORT);
     source_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    // Створення UDP сокету
     int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
     bind(sock, (struct sockaddr *)&source_addr, sizeof(source_addr));
 
+    // Налаштування таймауту для recvfrom
     struct timeval timeout;
     timeout.tv_sec = 0; // 0 секунд
     timeout.tv_usec = 100000; // 100 мілісекунд
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    uint8_t *w_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
-    assert(w_buf); // Check if w_buf allocation success
-    size_t w_bytes = 0;
+    // Виділення пам'яті для буфера даних та дешифрованого буфера
+    uint8_t *write_buf = (uint8_t *)calloc(1, UDP_BUFFER_SIZE);
+    uint8_t *decrypted_buf = (uint8_t *)calloc(1, UDP_BUFFER_SIZE);
+    assert(write_buf); // Перевірка на успішне виділення пам'яті
+    assert(decrypted_buf);
+    size_t write_bytes = 0;     
 
-    TickType_t last_receive_time = xTaskGetTickCount();
+    TickType_t last_receive_time = xTaskGetTickCount(); // Час останнього отримання даних
     const TickType_t timeout_ticks = pdMS_TO_TICKS(100); // 100 мілісекунд таймаут
 
     while (1) {
@@ -363,15 +394,17 @@ void udp_receive_task(void *pvParameters)
 
         struct sockaddr_in dest_addr;
         socklen_t socklen = sizeof(dest_addr);
-        int len = recvfrom(sock, w_buf, EXAMPLE_BUFF_SIZE, 0, (struct sockaddr *)&dest_addr, &socklen);
+
+        // Отримання даних по UDP   
+        int len = recvfrom(sock, write_buf, UDP_BUFFER_SIZE, 0, (struct sockaddr *)&dest_addr, &socklen);
 
         if (len < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 // Таймаут recvfrom, продовжуємо цикл
                 if (xTaskGetTickCount() - last_receive_time > timeout_ticks) {
-                    memset(w_buf, 0, EXAMPLE_BUFF_SIZE); // Очищення буфера при таймауті
-                    for (int i = 0; i < 5; i++) { // Відправляємо кілька нульових буферів поспіль
-                        if (i2s_channel_write(tx_chan, w_buf, EXAMPLE_BUFF_SIZE, &w_bytes, 1000) != ESP_OK) {
+                    memset(write_buf, 0, UDP_BUFFER_SIZE); // Очищення буфера звуку при таймауті
+                    for (int i = 0; i < 5; i++) {
+                        if (i2s_channel_write(tx_chan, write_buf, UDP_BUFFER_SIZE, &write_bytes, 1000) != ESP_OK) {
                             ESP_LOGE(TAG, "i2s write failed");
                             break; // Виходимо з циклу, якщо запис не вдається
                         }
@@ -384,42 +417,27 @@ void udp_receive_task(void *pvParameters)
         } else {
             last_receive_time = xTaskGetTickCount(); // Оновлюємо час останнього отримання даних
 
-            if (i2s_channel_write(tx_chan, w_buf, len, &w_bytes, 1000) != ESP_OK) {
+            // Дешифрування даних, якщо увімкнено шифрування
+            if (encryption_enabled) {
+                my_aes_decrypt(write_buf, decrypted_buf, len, aes_key);
+            } else {
+                memcpy(decrypted_buf, write_buf, len);
+            }
+
+            // Запис даних у I2S канал
+            if (i2s_channel_write(tx_chan, decrypted_buf, len, &write_bytes, 1000) != ESP_OK) {
                 ESP_LOGE(TAG, "i2s write failed");
             }
         }
-
-       // vTaskDelay(10 / portTICK_PERIOD_MS); // Додаємо невелику затримку
     }
 
-    free(w_buf);
+    // Звільнення виділеної пам'яті
+    free(write_buf);
+    free(decrypted_buf);
 }
 
-
-// void clear_sound_task(void *pvParameters)
-// {
-//     uint8_t *w_buf = (uint8_t *)calloc(1, EXAMPLE_BUFF_SIZE);
-//     assert(w_buf); // Check if w_buf allocation success
-//     size_t w_bytes = 0;
-
-//     while (1) {
-//         // Перевірка на таймаут
-//         if (xTaskGetTickCount() - last_receive_time > timeout_ticks) {
-//             memset(w_buf, 0, EXAMPLE_BUFF_SIZE); // Очищення буфера при таймауті
-//             if (i2s_channel_write(tx_chan, w_buf, EXAMPLE_BUFF_SIZE, &w_bytes, 1000) != ESP_OK) {
-//                 ESP_LOGE(TAG, "i2s write failed");
-//             }
-//         }
-
-//         vTaskDelay(500 / portTICK_PERIOD_MS); // Перевірка кожні 500 мс
-//     }
-
-//     free(w_buf);
-// }
-
-
-
-void microphone_init(void)
+// Конфігурація I2S каналу для приймання (RX) даних
+void microphone_init(void)  
 {
     i2s_chan_config_t rx_chan_cfg  = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_RX, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg , NULL, &rx_chan));
@@ -448,6 +466,7 @@ void microphone_init(void)
     ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
 }
 
+// Конфігурація I2S каналу для передавання (TX) даних
 void speaker_init(void)
 {
     i2s_chan_config_t tx_chan_cfg  = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_TX, I2S_ROLE_MASTER);
@@ -472,22 +491,28 @@ void speaker_init(void)
     ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
 }
 
+
 void app_main(void)
 {
+    // Ініціалізація NVS (Non-Volatile Storage)
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    // Ініціалізація мережевого інтерфейсу
     ESP_ERROR_CHECK(esp_netif_init());
+
+    // Створення циклу обробки подій за замовчуванням
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init();
     microphone_init();
     speaker_init();
+
+    // Затримка для стабілізації системи перед запуском задач
     vTaskDelay(5000 / portTICK_PERIOD_MS);
 
     xTaskCreate(udp_send_task, "udp_send_task", 4096, NULL, 2, NULL); 
     xTaskCreate(udp_receive_task, "udp_receive_task", 4096, NULL, 2, NULL);
 
     xTaskCreate(button_task, "button_task", 4096, NULL, 3, NULL);
-
-    //xTaskCreate(clear_sound_task, "clear_sound_task", NULL, 3, NULL)
-   // ESP_LOGE(TAG, "Main OK");
+    xTaskCreate(encryption_button_task, "encryption_button_task", 4096, NULL, 3, NULL);
 }
