@@ -1,3 +1,7 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -5,15 +9,20 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
-#include <string.h>
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "math.h"
 #include "mbedtls/aes.h"
+#include "esp_err.h"
+#include "esp_system.h"
+#include "esp_vfs.h"
+#include "esp_spiffs.h"
+#include "st7789.h"
+#include "fontx.h"
 
 // Визначаємо пристрій сервер чи клієнт
-//#define IS_SERVER
-#define IS_CLIENT
+#define IS_SERVER
+//#define IS_CLIENT
 
 #define I2S_NUM_TX 0
 #define I2S_NUM_RX 1
@@ -53,6 +62,7 @@ static const char *TAG = "Walkie_Talkie";
 static bool got_ip = false;
 #endif
 volatile bool transmit_data = false;
+volatile bool receiving_data = false;
 volatile bool encryption_enabled = true;
 
 // Обробник подій Wi-Fi
@@ -305,7 +315,6 @@ void my_aes_decrypt(uint8_t *input, uint8_t *output, size_t length, uint8_t *key
     mbedtls_aes_free(&aes);
 }
 
-
 void udp_send_task(void *pvParameters)
 {
     int addr_family = AF_INET;
@@ -399,6 +408,7 @@ void udp_receive_task(void *pvParameters)
         int len = recvfrom(sock, write_buf, UDP_BUFFER_SIZE, 0, (struct sockaddr *)&dest_addr, &socklen);
 
         if (len < 0) {
+            receiving_data = false;
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 // Таймаут recvfrom, продовжуємо цикл
                 if (xTaskGetTickCount() - last_receive_time > timeout_ticks) {
@@ -423,6 +433,8 @@ void udp_receive_task(void *pvParameters)
             } else {
                 memcpy(decrypted_buf, write_buf, len);
             }
+
+            receiving_data = true;
 
             // Запис даних у I2S канал
             if (i2s_channel_write(tx_chan, decrypted_buf, len, &write_bytes, 1000) != ESP_OK) {
@@ -491,6 +503,134 @@ void speaker_init(void)
     ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
 }
 
+// Функція для відображення тексту на дисплеї
+void DrawText(TFT_t * dev, FontxFile *fx, int width, int height, const char* text1, const char* text2, const char* text3, const char* text4, uint16_t bgColor, uint16_t textColor) {
+    uint16_t xpos1, ypos1, xpos2, ypos2, xpos3, ypos3, xpos4, ypos4;
+    uint8_t ascii1[24], ascii2[24], ascii3[24], ascii4[24];
+
+    // Встановлюємо колір фону 
+    lcdFillScreen(dev, bgColor);
+
+    // Встановлюємо тексти для відображення
+    strcpy((char *)ascii1, text1);
+    strcpy((char *)ascii2, text2);
+    strcpy((char *)ascii3, text3);
+    strcpy((char *)ascii4, text4);
+
+    // Розраховуємо позицію для центрування першого тексту
+    uint8_t buffer[FontxGlyphBufSize];
+    uint8_t fontWidth;
+    uint8_t fontHeight;
+    GetFontx(fx, 0, buffer, &fontWidth, &fontHeight);
+    xpos1 = (width - (strlen((char *)ascii1) * fontWidth)) / 2;
+    ypos1 = (height / 2) - fontHeight * 3;
+
+    // Розраховуємо позицію для центрування другого тексту
+    xpos2 = (width - (strlen((char *)ascii2) * fontWidth)) / 2;
+    ypos2 = (height / 2) - fontHeight;
+
+    // Розраховуємо позицію для центрування третього тексту
+    xpos3 = (width - (strlen((char *)ascii3) * fontWidth)) / 2;
+    ypos3 = (height / 2) + fontHeight;
+
+    // Розраховуємо позицію для центрування четвертого тексту
+    xpos4 = (width - (strlen((char *)ascii4) * fontWidth)) / 2;
+    ypos4 = (height / 2) + fontHeight * 3;
+
+    // Встановлюємо напрямок шрифту та колір
+    lcdSetFontDirection(dev, DIRECTION0);
+    lcdDrawString(dev, fx, xpos1, ypos1, ascii1, textColor);
+    lcdDrawString(dev, fx, xpos2, ypos2, ascii2, textColor);
+    if (strlen((char *)ascii3) > 0) {
+        lcdDrawString(dev, fx, xpos3, ypos3, ascii3, textColor);
+    }
+    if (strlen((char *)ascii4) > 0) {
+        lcdDrawString(dev, fx, xpos4, ypos4, ascii4, textColor);
+    }
+    lcdDrawFinish(dev);
+}
+
+// Функція для управління дисплеєм ST7789
+void ST7789(void *pvParameters)
+{
+    // Ініціалізація файлу шрифту
+    FontxFile fx16G[2];
+    InitFontx(fx16G,"/spiffs/ILGH16XB.FNT",""); // 8x16Dot Gothic
+
+    TFT_t dev;
+
+    // Ініціалізація дисплея
+    spi_master_init(&dev, CONFIG_MOSI_GPIO, CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, CONFIG_DC_GPIO, CONFIG_RESET_GPIO, CONFIG_BL_GPIO);
+    lcdInit(&dev, CONFIG_WIDTH, CONFIG_HEIGHT, CONFIG_OFFSETX, CONFIG_OFFSETY);
+
+    esp_rom_gpio_pad_select_gpio(BUTTON_GPIO);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    char encryption_status[24];
+    
+    bool last_transmit_state = false;
+    bool last_receive_state = false;
+    bool last_encryption_state = encryption_enabled;
+
+    // Стартове оновлення дисплея
+    snprintf(encryption_status, sizeof(encryption_status), "Encryption: %s", encryption_enabled ? "ON" : "OFF");
+#ifdef IS_SERVER
+    DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "SERVER", "", encryption_status, BLUE, WHITE);
+#else
+    DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "CLIENT", "", encryption_status, BLUE, WHITE);
+#endif
+
+    while (1) {
+        bool update_display = false;
+
+        // Перевірка на зміну станів передавання/прийому/шифрування
+        if (transmit_data != last_transmit_state) {
+            last_transmit_state = transmit_data;
+            update_display = true;
+        }
+
+        if (receiving_data != last_receive_state) {
+            last_receive_state = receiving_data;
+            update_display = true;
+        }
+
+        if (encryption_enabled != last_encryption_state) {
+            last_encryption_state = encryption_enabled;
+            update_display = true;
+        }
+
+        snprintf(encryption_status, sizeof(encryption_status), "Encryption: %s", encryption_enabled ? "ON" : "OFF");
+
+        // Оновлення дисплея, якщо змінився якийсь стан
+        if (update_display) {
+#ifdef IS_SERVER
+            if (transmit_data && receiving_data) { // Повний дуплекс
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "SERVER", "Full-Duplex", encryption_status, PURPLE, WHITE);
+            } else if (transmit_data) { // Передача даних
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "SERVER", "Transmitting", encryption_status, RED, WHITE);
+            } else if (receiving_data) { // Прийом даних
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "SERVER", "Receiving", encryption_status, GREEN, WHITE);
+            } else { // Бездіяльність
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "SERVER", "", encryption_status, BLUE, WHITE);
+            }
+#else
+            if (transmit_data && receiving_data) { // Повний дуплекс    
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "CLIENT", "Full-Duplex", encryption_status, PURPLE, WHITE);
+            } else if (transmit_data) { // Передача даних
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "CLIENT", "Transmitting", encryption_status, RED, WHITE);
+            } else if (receiving_data) { // Прийом даних
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "CLIENT", "Receiving", encryption_status, GREEN, WHITE);
+            } else { // Бездіяльність
+                DrawText(&dev, fx16G, CONFIG_WIDTH, CONFIG_HEIGHT, "Walkie-Talkie", "CLIENT", "", encryption_status, BLUE, WHITE);
+            }
+#endif
+        }
+
+        // Перевірка станів кожні 200 мс
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+}
 
 void app_main(void)
 {
@@ -506,6 +646,29 @@ void app_main(void)
     wifi_init();
     microphone_init();
     speaker_init();
+    
+    ESP_LOGI(TAG, "Initializing SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 12,
+        .format_if_mount_failed = true
+    };
+
+    esp_err_t spiffs = esp_vfs_spiffs_register(&conf);
+
+    // Перевірка, чи успішно була ініціалізована файлова системи SPIFFS
+    if (spiffs != ESP_OK) {
+        if (spiffs == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        } else if (spiffs == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)",esp_err_to_name(spiffs));
+        }
+        return;
+    }
 
     // Затримка для стабілізації системи перед запуском задач
     vTaskDelay(5000 / portTICK_PERIOD_MS);
@@ -515,4 +678,6 @@ void app_main(void)
 
     xTaskCreate(button_task, "button_task", 4096, NULL, 3, NULL);
     xTaskCreate(encryption_button_task, "encryption_button_task", 4096, NULL, 3, NULL);
+
+    xTaskCreate(ST7789, "ST7789", 4096, NULL, 1, NULL);
 }
